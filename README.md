@@ -1,4 +1,6 @@
-# Reproducibility guide
+## Calibrating Score Banks for Earth-Observation Anomaly Detection: Multiplicity, Tail Shape, and Power
+
+This repository is the research companion for the REO2 2026 paper "Calibrating Score Banks for Earth Observation Anomaly Detection. Multiplicity, Tail Shape, and Power."
 
 ## Scope
 
@@ -54,24 +56,3 @@ The forecast score bank and quality feature detectors use different inputs and
 operating points. Their comparison is diagnostic evidence about representation
 alignment. It is not a controlled comparison of aggregation rules.
 
-## Compact reported results
-
-- `results/fusion_baselines.csv`
-- `results/esa_real_event_summary.csv`
-- `docs/downloads/family_summary.csv`
-
-These tables contain the values reported in the revised manuscript. They do not
-contain cube level or event level data.
-
-## Missing large artifacts
-
-The following items must be supplied locally.
-
-- EarthNet2021 data
-- EarthNet forecast checkpoints
-- Frozen image only and multimodal forecast caches
-- ESA ADB Mission 1 data
-- Frozen ESA protocol artifacts
-
-Do not commit those items unless their licenses and file sizes are suitable for
-public redistribution.
