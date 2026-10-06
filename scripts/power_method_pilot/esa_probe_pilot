@@ -1,0 +1,810 @@
+"""Exploratory ESA response-probe ablations. No frozen evaluation rows are used.
+
+Run ``extract`` and then ``run``. This is an experiment, not a validated method.
+The accompanying README specifies the estimands and limits of the uncertainty
+summaries. In particular, the prediction bootstrap does not refit the learner.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import platform
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+MODELS = ("persistence", "univariate_ar1", "cross_channel_ridge")
+ALLOWED_ROLES = {
+    "audit_nominal_fit", "nll_validation", "anomaly_design",
+    "paired_nominal_design",
+}
+STATS = ("top_mean", "top_max", "top_channels", "rms")
+BASE_SETS = ("S", "C", "SC", "SCG", "SCD", "SCGD", "SCF", "SCB")
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def stable_seed(*parts):
+    raw = "|".join(map(str, parts)).encode()
+    return int.from_bytes(hashlib.sha256(raw).digest()[:4], "big")
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def json_write(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def new_output(path):
+    path = Path(path)
+    require(not path.exists() or not any(path.iterdir()),
+            f"Output is not empty: {path}. Use a new versioned output directory.")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def protect_source(output, source):
+    output, source = Path(output).resolve(), Path(source).resolve()
+    require(output != source and source not in output.parents,
+            "Write the new experiment outside outputs/esa_real_event_readiness.")
+
+
+def verify_selected_seals(root, selected):
+    """Verify metadata/parameters used here; do not open evaluation feature CSVs."""
+    records = {}
+    seals = [
+        root / "FROZEN_MODEL_PROTOCOL_SHA256SUMS.txt",
+        root / "FROZEN_WINDOW_PLAN_SHA256SUMS.txt",
+        root / "forecast_representations/SHA256SUMS.txt",
+        root / "window_tensor/SHA256SUMS.txt",
+    ]
+    targets = {p.resolve(): p for p in selected}
+    for seal in seals:
+        require(seal.exists(), f"Missing source seal: {seal}")
+        for line in seal.read_text().splitlines():
+            if not line.strip():
+                continue
+            expected, name = line.split(maxsplit=1)
+            path = Path(name.strip().lstrip("*")).resolve()
+            if path in targets:
+                observed = digest(path)
+                require(observed == expected, f"Source checksum mismatch: {path}")
+                records[str(targets[path])] = observed
+    missing = [str(p) for p in selected if str(p) not in records]
+    require(not missing, f"These required inputs were absent from the seals: {missing}")
+    return records
+
+
+def choose_development(plan, roles):
+    require(not roles.unit_id.duplicated().any(), "Duplicate model-role unit IDs")
+    require(not plan.duplicated(["unit_id", "target_family"]).any(),
+            "Duplicate unit/family plan rows")
+    role_map = roles.set_index("unit_id").model_role
+    require(set(plan.unit_id) == set(role_map.index), "Plan and role IDs differ")
+    selected = plan[plan.unit_id.map(role_map).isin(ALLOWED_ROLES)].copy()
+    records = []
+    for uid, group in selected.groupby("unit_id", sort=True):
+        role = str(role_map.loc[uid])
+        require(group.window_start.nunique() == 1, f"Conflicting anchors for {uid}")
+        require(group.history_start.nunique() == 1, f"Conflicting histories for {uid}")
+        item = group.iloc[0]
+        pair = str(item.get("pair_id", "")).strip()
+        if role in {"anomaly_design", "paired_nominal_design"}:
+            require(len(group) == 1 and pair not in {"", "nan"},
+                    f"Ambiguous design pair: {uid}")
+        else:
+            require(pair in {"", "nan"}, f"Unexpected nominal pair: {uid}")
+            pair = ""
+        label = int(role == "anomaly_design")
+        records.append({
+            "unit_id": uid, "source_role": role, "label": label,
+            "family": str(item.target_family) if label else "nominal",
+            "associated_family": str(item.target_family) if pair else "",
+            "group_id": f"pair:{pair}" if pair else f"unit:{uid}",
+            "window_start": item.window_start,
+            "available_window_end": group.window_end.min(),
+            "history_start": item.history_start,
+        })
+    result = pd.DataFrame(records)
+    require(not result.empty, "No eligible development units")
+    for gid, group in result.groupby("group_id"):
+        if gid.startswith("pair:"):
+            require(len(group) == 2 and sorted(group.label) == [0, 1],
+                    f"Missing or duplicated anomaly/control pair: {gid}")
+            require(group.associated_family.nunique() == 1,
+                    f"Pair crosses families: {gid}")
+        else:
+            require(len(group) == 1 and group.label.iloc[0] == 0,
+                    f"Invalid nominal unit group: {gid}")
+    return result
+
+
+def top_features(z):
+    a = np.abs(z)
+    k = max(1, math.ceil(len(a) * 0.10))
+    return np.partition(a, len(a) - k, axis=0)[-k:].mean(axis=0)
+
+
+def score_vector(z):
+    f = top_features(z)
+    k = max(1, math.ceil(len(f) * 0.10))
+    return np.array([f.mean(), f.max(), np.partition(f, len(f) - k)[-k:].mean(),
+                     np.sqrt(np.mean(z * z))])
+
+
+def standardized_residuals(x, parameters):
+    idx = parameters["target_indices"].astype(int)
+    previous, target = x[:-1], x[1:, idx]
+    return {
+        "persistence": (target - previous[:, idx]) /
+            np.sqrt(parameters["persistence_variance"]),
+        "univariate_ar1": (target - parameters["ar_intercept"] -
+            previous[:, idx] * parameters["ar_slope"]) /
+            np.sqrt(parameters["univariate_ar1_variance"]),
+        "cross_channel_ridge": (target - parameters["ridge_beta"][0] -
+            previous @ parameters["ridge_beta"][1:]) /
+            np.sqrt(parameters["cross_channel_ridge_variance"]),
+    }
+
+
+def validate_parameters(parameters, n_inputs):
+    idx = np.asarray(parameters["target_indices"])
+    require(idx.ndim == 1 and len(idx) > 0 and np.array_equal(idx, idx.astype(int)),
+            "Target indices must be a nonempty integer vector")
+    require(len(np.unique(idx)) == len(idx) and np.all((idx >= 0) & (idx < n_inputs)),
+            "Duplicate or out-of-range target indices")
+    d = len(idx)
+    shapes = {"input_mean": (n_inputs,), "input_scale": (n_inputs,),
+              "ar_intercept": (d,), "ar_slope": (d,), "ridge_beta": (n_inputs + 1, d)}
+    shapes.update({f"{m}_variance": (d,) for m in MODELS})
+    for name, shape in shapes.items():
+        a = np.asarray(parameters[name])
+        require(a.shape == shape and np.isfinite(a).all(), f"Invalid frozen parameter: {name}")
+    for name in ["input_scale", *[f"{m}_variance" for m in MODELS]]:
+        require(np.all(parameters[name] > 0), f"Nonpositive frozen scale/variance: {name}")
+
+
+def residual_response(perturbation, parameters):
+    """Exact response of these frozen affine one-step forecasters.
+
+    Row zero is the unmodified last history observation. Modifying a future
+    observation also modifies the input to the NEXT forecast; that effect must
+    not be omitted for persistence, AR1, or cross-channel ridge.
+    """
+    idx = parameters["target_indices"].astype(int)
+    previous, target = perturbation[:-1], perturbation[1:, idx]
+    return {
+        "persistence": (target - previous[:, idx]) /
+            np.sqrt(parameters["persistence_variance"]),
+        "univariate_ar1": (target - previous[:, idx] * parameters["ar_slope"]) /
+            np.sqrt(parameters["univariate_ar1_variance"]),
+        "cross_channel_ridge": (target - previous @ parameters["ridge_beta"][1:]) /
+            np.sqrt(parameters["cross_channel_ridge_variance"]),
+    }
+
+
+def probe_bank(parameters, frozen_heads, steps):
+    idx = parameters["target_indices"].astype(int)
+    d = len(idx)
+    directions = {"all": np.ones(d), "alternating": (-1.0) ** np.arange(d)}
+    single = np.zeros(d)
+    single[0] = 1.0
+    directions["first_target_channel"] = single
+    entries = frozen_heads["representations"]["persistence"]["heads"]
+    groups = sorted([h for h in entries if h["kind"] == "metadata_group"],
+                    key=lambda h: h["name"])
+    require(groups, "The frozen metadata dictionary has no channel groups")
+    directions["first_metadata_group"] = np.asarray(groups[0]["direction"])
+    waves = {"step": np.ones(steps), "ramp": np.linspace(1 / steps, 1, steps)}
+    result = []
+    for name, vector in directions.items():
+        require(np.asarray(vector).shape == (d,) and np.isfinite(vector).all()
+                and np.linalg.norm(vector) > 0, f"Invalid probe vector: {name}")
+        vector = vector / np.linalg.norm(vector)
+        for shape, wave in waves.items():
+            perturbation = np.zeros((steps + 1, len(parameters["input_mean"])))
+            perturbation[1:, idx] = wave[:, None] * vector[None, :]
+            result.append((f"{name}:{shape}", perturbation))
+    return result
+
+
+def quality_features(history, x, params):
+    """Ordinary competing quality information, available without event labels."""
+    out = {}
+    for prefix, a in (("history", history), ("window", x[1:])):
+        diffs = np.diff(a, axis=0)
+        vals = {
+            "abs_mean": np.abs(a).mean(), "abs_q95": np.quantile(np.abs(a), .95),
+            "channel_sd_mean": np.std(a, axis=0).mean(),
+            "step_abs_mean": np.abs(diffs).mean(),
+            "step_abs_q95": np.quantile(np.abs(diffs), .95),
+            "unchanged_fraction": np.mean(diffs == 0),
+        }
+        out.update({f"C__{prefix}__{k}": float(v) for k, v in vals.items()})
+    idx = params["target_indices"].astype(int)
+    prev = x[:-1]
+    predictions = [prev[:, idx], params["ar_intercept"] + prev[:, idx] * params["ar_slope"],
+                   params["ridge_beta"][0] + prev @ params["ridge_beta"][1:]]
+    for i in range(3):
+        for j in range(i + 1, 3):
+            out[f"C__forecast_disagreement_{i}_{j}"] = float(
+                np.mean(np.abs(predictions[i] - predictions[j])))
+    return out
+
+
+def extract(args):
+    root = args.root
+    protect_source(args.output, root)
+    paths = {
+        "plan": root / "mission1_frozen_window_plan.csv",
+        "roles": root / "mission1_frozen_model_unit_roles.csv",
+        "protocol": root / "mission1_frozen_model_protocol.json",
+        "heads": root / "mission1_frozen_metadata_heads.json",
+        "units": root / "window_tensor/units.csv",
+        "channels": root / "window_tensor/channels.csv",
+        "tensor_manifest": root / "window_tensor/manifest.json",
+        "parameters": root / "forecast_representations/forecaster_parameters.npz",
+    }
+    for path in paths.values():
+        require(path.exists(), f"Missing input: {path}")
+    hashes = verify_selected_seals(root, list(paths.values()))
+    # The large telemetry tensor is memory-mapped; only allowed rows are sliced.
+    # We rely on its previously verified seal, and record that fact explicitly.
+    protocol = json.loads(paths["protocol"].read_text())
+    frozen_heads = json.loads(paths["heads"].read_text())
+    plan = pd.read_csv(paths["plan"], dtype=str, keep_default_na=False)
+    roles = pd.read_csv(paths["roles"], dtype=str, keep_default_na=False)
+    units = pd.read_csv(paths["units"], dtype={"unit_id": str})
+    channels = pd.read_csv(paths["channels"])
+    for c in ("history_start", "window_start", "window_end"):
+        plan[c] = pd.to_datetime(plan[c], format="mixed", utc=True)
+    units["history_start"] = pd.to_datetime(units.history_start, format="mixed", utc=True)
+    selected = choose_development(plan, roles)
+    require(not units.unit_id.duplicated().any(), "Duplicate tensor IDs")
+    require(set(units.unit_id) == set(roles.unit_id), "Tensor and role IDs differ")
+    with np.load(paths["parameters"], allow_pickle=False) as data:
+        params = {name: data[name] for name in data.files}
+    column = "Channel" if "Channel" in channels else "channel"
+    require(column in channels, "Missing tensor channel-name column")
+    names = channels[column].astype(str).tolist()
+    require(names == protocol["input_channels"], "Tensor channel order changed")
+    validate_parameters(params, len(names))
+    idx = params["target_indices"].astype(int)
+    require([names[i] for i in idx] == list(params["target_names"].astype(str)),
+            "Parameter target-channel order differs from tensor")
+    require(list(params["target_names"].astype(str)) == protocol["target_channels"],
+            "Frozen target channels changed")
+    cadence = 30
+    steps_exact = args.horizon_hours * 3600 / cadence
+    require(steps_exact >= 2 and steps_exact == round(steps_exact),
+            "Horizon must contain an integer number of 30-second steps")
+    steps = int(steps_exact)
+    require(args.horizon_hours <= 1, "Use at most one hour: all families must share a horizon")
+    require(all(np.isfinite(e) and e > 0 for e in args.epsilons)
+            and len(set(args.epsilons)) == len(args.epsilons),
+            "Probe amplitudes must be distinct, finite and positive")
+    bank = probe_bank(params, frozen_heads, steps)
+    responses = [(name, residual_response(p, params)) for name, p in bank]
+    tensor_path = root / "window_tensor/telemetry.npy"
+    tensor = np.load(tensor_path, mmap_mode="r", allow_pickle=False)
+    require(tensor.shape == (len(units), int(units.length.max()), len(names)),
+            "Tensor shape differs from metadata")
+    positions = {uid: i for i, uid in enumerate(units.unit_id)}
+    output = new_output(args.output)
+    print("=== DEVELOPMENT-ONLY PROBE EXTRACTION ===", flush=True)
+    print("No anomaly_test, nominal_test, nominal_calibration or forecaster_fit tensor rows used.")
+    print("Original ESA protocol unchanged. New exploratory common horizon:", args.horizon_hours, "hour(s)")
+    print("Pure nominal and paired-control units:", int((selected.label == 0).sum()))
+    print("Anomaly design units:", int(selected.label.sum()))
+    print("Probe directions/shapes:", len(bank), "amplitudes:", args.epsilons)
+    records = []
+    for number, row in enumerate(selected.itertuples(index=False), 1):
+        pos = positions[row.unit_id]
+        info = units.iloc[pos]
+        delta = (row.window_start - info.history_start).total_seconds() / cadence
+        require(abs(delta - round(delta)) < 1e-6, f"Off-grid window: {row.unit_id}")
+        start = int(round(delta))
+        end = start + steps
+        require(start >= 2 and end <= int(info.length), f"Insufficient tensor coverage: {row.unit_id}")
+        require(row.window_start + pd.Timedelta(hours=args.horizon_hours) <= row.available_window_end,
+                f"Requested window exceeds frozen coverage: {row.unit_id}")
+        # This is the ONLY telemetry slice: row.unit_id has already passed the allow-list.
+        raw = np.asarray(tensor[pos, :end], dtype=float)
+        require(np.isfinite(raw).all(), f"Non-finite telemetry: {row.unit_id}")
+        xall = (raw - params["input_mean"]) / params["input_scale"]
+        # Targets are t=start,...,start+steps-1, a common half-open one-hour interval.
+        x = xall[start - 1:end]
+        z = standardized_residuals(x, params)
+        record = {k: getattr(row, k) for k in (
+            "unit_id", "source_role", "label", "family", "associated_family", "group_id")}
+        record["window_start"] = row.window_start.isoformat()
+        record["horizon_hours"] = args.horizon_hours
+        record.update(quality_features(xall[:start], x, params))
+        for model in MODELS:
+            base = score_vector(z[model])
+            for name, value in zip(STATS, base):
+                record[f"S__{model}__{name}"] = float(value)
+            channel_summaries = {
+                "top_abs_mean": top_features(z[model]),
+                "signed_mean": z[model].mean(axis=0),
+                "sd": z[model].std(axis=0),
+                "positive_fraction": (z[model] > 0).mean(axis=0),
+            }
+            for statistic, values in channel_summaries.items():
+                for name, value in zip(params["target_names"].astype(str), values):
+                    record[f"F__{model}__{name}__{statistic}"] = float(value)
+            for eps in args.epsilons:
+                derivatives, curvatures = [], []
+                for name, response in responses:
+                    plus = score_vector(z[model] + eps * response[model])[:2]
+                    minus = score_vector(z[model] - eps * response[model])[:2]
+                    derivative = (plus - minus) / (2 * eps)
+                    curvature = (plus + minus - 2 * base[:2]) / eps ** 2
+                    derivatives.append(derivative)
+                    curvatures.append(curvature)
+                    for stat, value in zip(STATS[:2], derivative):
+                        record[f"D__{model}__{eps:g}__{name}__{stat}"] = float(value)
+                derivatives, curvatures = np.asarray(derivatives), np.asarray(curvatures)
+                for j, stat in enumerate(STATS[:2]):
+                    for kind, value in (
+                        ("mean_abs_sensitivity", np.abs(derivatives[:, j]).mean()),
+                        ("max_abs_sensitivity", np.abs(derivatives[:, j]).max()),
+                        ("mean_abs_curvature", np.abs(curvatures[:, j]).mean()),
+                    ):
+                        record[f"G__{model}__{eps:g}__{stat}__{kind}"] = float(value)
+        records.append(record)
+        if number == 1 or number % 20 == 0 or number == len(selected):
+            print(f"[{number}/{len(selected)}] development units extracted", flush=True)
+    frame = pd.DataFrame(records)
+    feature_names = [c for c in frame if "__" in c]
+    require(np.isfinite(frame[feature_names].to_numpy(float)).all(), "Non-finite extracted features")
+    frame.to_csv(output / "development_probe_features.csv", index=False)
+    spread = pd.DataFrame({
+        "feature": feature_names, "sd": frame[feature_names].std().to_numpy(),
+        "unique_values": frame[feature_names].nunique().to_numpy(),
+    })
+    spread.to_csv(output / "feature_variability.csv", index=False)
+    manifest = {
+        "status": "exploratory_development_only", "source_hashes": hashes,
+        "tensor_full_checksum_reverified_here": False,
+        "tensor_integrity_requirement": "previously verified window_tensor/SHA256SUMS.txt",
+        "excluded_tensor_roles": ["forecaster_fit", "nominal_calibration", "nominal_test", "anomaly_test"],
+        "horizon_hours": args.horizon_hours, "cadence_seconds": cadence,
+        "probe_amplitudes_in_input_training_sd_units": args.epsilons,
+        "probe_channel_vectors_have_unit_l2_norm": True,
+        "probes": [name for name, _ in bank],
+        "probe_response": "exact affine-forecaster response followed by finite differences of nonlinear scores",
+        "schema_version": 1, "rows": len(frame), "feature_columns": feature_names,
+        "features_sha256": digest(output / "development_probe_features.csv"),
+        "script_sha256": digest(__file__),
+    }
+    json_write(output / "manifest.json", manifest)
+    print("\n=== DEVELOPMENT COUNTS ===")
+    print(frame.groupby(["source_role", "family"]).size().to_string())
+    print("Probe features with nonzero SD:", int(((spread.sd > 1e-12) & spread.feature.str.startswith("D__")).sum()))
+    print("Wrote", output / "development_probe_features.csv")
+    print("EXTRACTION COMPLETE. This is not a novelty or efficacy PASS.", flush=True)
+
+
+def conformal_threshold(values, alpha):
+    values = np.asarray(values, dtype=float)
+    require(0 < alpha < 1 and len(values) > 0 and np.isfinite(values).all(),
+            "Invalid conformal calibration input")
+    k = math.ceil((len(values) + 1) * (1 - alpha))
+    return float("inf") if k > len(values) else float(np.partition(values, k - 1)[k - 1])
+
+
+def validate_features(frame):
+    required = {"unit_id", "source_role", "label", "family", "group_id", "horizon_hours"}
+    require(required <= set(frame), f"Missing feature columns: {required - set(frame)}")
+    require(not frame.unit_id.duplicated().any(), "Duplicate independent-unit rows")
+    require(set(frame.source_role) <= ALLOWED_ROLES, "Forbidden source role in pilot features")
+    require(set(frame.label) == {0, 1}, "Both nominal and anomaly development units are required")
+    require(frame.horizon_hours.nunique() == 1, "Family-specific horizons would confound transfer")
+    for prefix in ("S__", "C__", "D__", "G__", "F__"):
+        cols = [c for c in frame if c.startswith(prefix)]
+        require(cols and np.isfinite(frame[cols].to_numpy(float)).all(), f"Missing/invalid {prefix} block")
+    require((frame.loc[frame.label == 1, "source_role"] == "anomaly_design").all(),
+            "Positive rows must be anomaly_design")
+    require((frame.loc[frame.label == 0, "family"] == "nominal").all(),
+            "Nominal labels must use family=nominal")
+    for gid, g in frame.groupby("group_id"):
+        require((len(g) == 1 and g.label.iloc[0] == 0) or
+                (len(g) == 2 and sorted(g.label) == [0, 1]), f"Invalid paired group: {gid}")
+
+
+def build_splits(frame, folds, cal_units, seed, mode):
+    require(folds >= 2 and cal_units >= 1, "Invalid fold/calibration count")
+    require(mode in {"within", "leave_family_out"}, "Unknown split mode")
+    groups = {}
+    for gid, g in frame.groupby("group_id", sort=True):
+        positive = g[g.label == 1]
+        groups[gid] = positive.family.iloc[0] if len(positive) else "nominal"
+    families = sorted(set(groups.values()) - {"nominal"})
+    require(families, "No design anomaly families")
+    assignment = {}
+    for family in ["nominal", *families]:
+        ids = sorted(g for g, f in groups.items() if f == family)
+        require(len(ids) >= folds, f"{family}: fewer independent groups than folds")
+        order = np.random.default_rng(stable_seed(seed, "folds", family)).permutation(ids)
+        assignment.update({str(gid): j % folds for j, gid in enumerate(order)})
+    targets = ["all"] if mode == "within" else families
+    for held_family in targets:
+        for fold in range(folds):
+            test_groups = {g for g, f in groups.items() if assignment[g] == fold and
+                           (held_family == "all" or f in {held_family, "nominal"})}
+            available = {g for g, f in groups.items() if g not in test_groups and
+                         (held_family == "all" or f != held_family)}
+            pure = sorted(g for g in available if groups[g] == "nominal")
+            require(len(pure) > cal_units, "Insufficient distinct nominal groups for fitting and calibration")
+            order = np.random.default_rng(stable_seed(seed, "cal", held_family, fold)).permutation(pure)
+            calibration = set(order[:cal_units])
+            training = available - calibration
+            require(not (training & calibration or training & test_groups or calibration & test_groups),
+                    "Independent groups crossed split roles")
+            split = {name: np.flatnonzero(frame.group_id.isin(ids).to_numpy()) for name, ids in
+                     (("train", training), ("calibration", calibration), ("heldout", test_groups))}
+            require(set(frame.iloc[split["train"]].label) == {0, 1}, "Training split lacks a class")
+            require((frame.iloc[split["calibration"]].label == 0).all(), "Anomalies entered calibration")
+            if held_family != "all":
+                require(held_family not in set(frame.iloc[split["train"]].family),
+                        "Held-out family entered training")
+            yield held_family, fold, split
+
+
+def sample_weights(train):
+    y = train.label.to_numpy()
+    families = sorted(train.loc[train.label == 1, "family"].unique())
+    w = np.zeros(len(train))
+    w[y == 0] = .5 / np.sum(y == 0)
+    for family in families:
+        mask = (train.family == family).to_numpy() & (y == 1)
+        w[mask] = .5 / len(families) / mask.sum()
+    return w * len(train)
+
+
+def limit_training_events(frame, split, budget, seed):
+    """Keep a nested label budget; drop both members of unused design pairs."""
+    require(budget >= 0, "Training event budget must be nonnegative; zero means all")
+    if budget == 0:
+        return split
+    train = frame.iloc[split["train"]]
+    retain = set(train.loc[~train.group_id.str.startswith("pair:"), "group_id"])
+    for family, group in train[train.label == 1].groupby("family", sort=True):
+        ids = sorted(group.group_id.unique())
+        require(len(ids) >= budget,
+                f"Family {family} has only {len(ids)} training events; requested {budget}")
+        order = np.random.default_rng(stable_seed(seed, "label_budget", family)).permutation(ids)
+        retain.update(order[:budget])
+    result = dict(split)
+    result["train"] = np.asarray([i for i in split["train"] if frame.iloc[i].group_id in retain])
+    return result
+
+
+def transform_blocks(train, others, dimension):
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    blocks = {}
+    audit = {}
+    for block in "SCGDFB":
+        prefix = "F" if block == "B" else block
+        cols = sorted(c for c in train if c.startswith(prefix + "__"))
+        arrays = [f[cols].to_numpy(float) for f in [train, *others]]
+        # Stabilize heavy tails with the SAME fixed transform for every feature block.
+        arrays = [np.sign(x) * np.log1p(np.abs(x)) for x in arrays]
+        scaler = StandardScaler().fit(arrays[0])
+        arrays = [scaler.transform(x) for x in arrays]
+        if block in "GDF":
+            keep = scaler.var_ > 1e-12
+            arrays = [x[:, keep] for x in arrays]
+            if not keep.any():
+                arrays = [np.zeros((len(x), 1)) for x in arrays]
+            k = min(dimension, arrays[0].shape[1], len(train) - 1)
+            # Both direction-specific and generic probe blocks have equal feature budgets.
+            if arrays[0].shape[1] > k:
+                pca = PCA(n_components=k, svd_solver="full").fit(arrays[0])
+                arrays = [pca.transform(x) for x in arrays]
+            post_scale = StandardScaler().fit(arrays[0])
+            arrays = [post_scale.transform(x) for x in arrays]
+            # Pad constant blocks so shuffled/generic/directional feature counts match.
+            arrays = [np.pad(x, ((0, 0), (0, dimension - x.shape[1]))) for x in arrays]
+        blocks[block] = arrays
+        audit[block] = {"raw_columns": len(cols), "model_columns": arrays[0].shape[1]}
+    return blocks, audit
+
+
+def learner_fit(kind, x, train, seed):
+    if kind == "logistic":
+        from sklearn.linear_model import LogisticRegression
+        model = LogisticRegression(C=.1, solver="liblinear", max_iter=2000, random_state=seed)
+    else:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        model = HistGradientBoostingClassifier(max_iter=60, max_leaf_nodes=4, max_depth=2,
+                    min_samples_leaf=10, learning_rate=.05, l2_regularization=10,
+                    early_stopping=False, random_state=seed)
+    model.fit(x, train.label.to_numpy(), sample_weight=sample_weights(train))
+    return model
+
+
+def predict_score(model, x):
+    if hasattr(model, "decision_function"):
+        return model.decision_function(x)
+    return model.predict_proba(x)[:, 1]
+
+
+def bootstrap_ranges(predictions, bootstrap, seed):
+    """Paired, conditional prediction-resampling diagnostics; NOT refit CIs."""
+    rows = []
+    key = ["mode", "held_family", "learner", "feature_set", "control_rep"]
+    for keys, group in predictions.groupby(key, sort=True):
+        unit = group.groupby(["unit_id", "group_id", "family", "label"], as_index=False).rejected.mean()
+        metrics = [("nominal_fpr", "nominal", unit[unit.label == 0])]
+        for family in sorted(unit.loc[unit.label == 1, "family"].unique()):
+            metrics.append(("power", family, unit[(unit.label == 1) & (unit.family == family)]))
+        for metric, family, subset in metrics:
+            a = subset.rejected.to_numpy(float)
+            # One row per highest-unit group within each metric/family.
+            require(not subset.group_id.duplicated().any(), "Metric duplicates an independent group")
+            rng = np.random.default_rng(stable_seed(seed, metric, family, len(a)))
+            draws = a[rng.integers(0, len(a), size=(bootstrap, len(a)))].mean(axis=1)
+            rows.append(dict(zip(key, keys)) | {
+                "metric": metric, "family": family, "estimate": a.mean(), "units": len(a),
+                "conditional_p025": np.quantile(draws, .025),
+                "conditional_p975": np.quantile(draws, .975),
+            })
+    return pd.DataFrame(rows)
+
+
+def paired_differences(predictions, bootstrap, seed):
+    rows = []
+    for keys, group in predictions[predictions.learner != "fixed"].groupby(
+            ["mode", "held_family", "learner"], sort=True):
+        base = group[group.feature_set == "SCD"].groupby(
+            ["unit_id", "group_id", "family", "label"], as_index=False).rejected.mean()
+        for comparison in ("SC", "SCG", "SCF", "SCB", "SCD_shuffled"):
+            other = group[group.feature_set == comparison].groupby(
+                ["unit_id", "group_id", "family", "label"], as_index=False).rejected.mean()
+            joined = base.merge(other, on=["unit_id", "group_id", "family", "label"],
+                                validate="one_to_one", suffixes=("_probe", "_comparison"))
+            require(len(joined) == len(base), "Ablations do not have identical held-out units")
+            joined["difference"] = joined.rejected_probe - joined.rejected_comparison
+            for family, subset in joined.groupby("family", sort=True):
+                a = subset.difference.to_numpy(float)
+                require(not subset.group_id.duplicated().any(), "Unpaired duplicate group")
+                rng = np.random.default_rng(stable_seed(seed, "paired", family, len(a)))
+                draws = a[rng.integers(0, len(a), size=(bootstrap, len(a)))].mean(axis=1)
+                rows.append(dict(zip(["mode", "held_family", "learner"], keys)) | {
+                    "contrast": f"SCD minus {comparison}", "family": family,
+                    "metric": "fpr_difference" if family == "nominal" else "power_difference",
+                    "estimate": a.mean(), "units": len(a),
+                    "conditional_p025": np.quantile(draws, .025),
+                    "conditional_p975": np.quantile(draws, .975),
+                })
+    return pd.DataFrame(rows)
+
+
+def make_figures(metrics, differences, folder, alpha):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    folder.mkdir(parents=True, exist_ok=True)
+    for (mode, held, learner), g in metrics[(metrics.learner != "fixed") &
+            (metrics.control_rep == -1)].groupby(["mode", "held_family", "learner"]):
+        power = g[g.metric == "power"].pivot(index="feature_set", columns="family", values="estimate")
+        fpr = g[g.metric == "nominal_fpr"].set_index("feature_set").estimate
+        order = [s for s in BASE_SETS if s in power.index]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+        for family in power:
+            axes[0].plot(np.arange(len(order)), power.loc[order, family], marker="o", label=family)
+        axes[0].set(ylabel="Development out-of-fold power", ylim=(-.02, 1.02))
+        axes[0].set_xticks(range(len(order)), order, rotation=40)
+        axes[0].legend()
+        axes[1].bar(range(len(order)), fpr.loc[order])
+        axes[1].axhline(alpha, color="black", linestyle="--", linewidth=1, label="Target alpha")
+        axes[1].legend()
+        axes[1].set_xticks(range(len(order)), order, rotation=40)
+        axes[1].set(ylabel="Development nominal rejection fraction")
+        fig.suptitle(f"{mode} | withheld={held} | {learner} | common horizon")
+        for extension in ("png", "pdf"):
+            fig.savefig(folder / f"{mode}_{held}_{learner}.{extension}", dpi=180)
+        plt.close(fig)
+    for (mode, held, learner), g in differences.groupby(["mode", "held_family", "learner"]):
+        g = g[g.metric == "power_difference"]
+        fig, ax = plt.subplots(figsize=(9, max(3, .42 * len(g))), constrained_layout=True)
+        labels = [f"{r.family}: {r.contrast}" for r in g.itertuples()]
+        y = np.arange(len(g))
+        ax.hlines(y, g.conditional_p025, g.conditional_p975, color="#666666")
+        ax.scatter(g.estimate, y, color="#225ea8")
+        ax.axvline(0, color="black", lw=.8)
+        ax.set_yticks(y, labels)
+        ax.set_xlabel("Paired power difference; conditional unit-resampling ranges")
+        ax.set_title(f"{mode} | {held} | {learner}; exploratory, no training refits")
+        for extension in ("png", "pdf"):
+            fig.savefig(folder / f"contrasts_{mode}_{held}_{learner}.{extension}", dpi=180)
+        plt.close(fig)
+
+
+def run(args):
+    source_manifest = args.features.parent / "manifest.json"
+    require(source_manifest.exists(), "Missing extraction manifest")
+    manifest = json.loads(source_manifest.read_text())
+    require(manifest.get("status") == "exploratory_development_only", "Wrong feature provenance")
+    require(digest(args.features) == manifest["features_sha256"], "Extracted features have changed")
+    frame = pd.read_csv(args.features, dtype={"unit_id": str, "group_id": str}, keep_default_na=False)
+    frame = frame.sort_values("unit_id").reset_index(drop=True)
+    validate_features(frame)
+    require(args.controls >= 1 and args.repeats >= 1 and args.bootstrap >= 20 and args.probe_dim >= 1,
+            "Use positive repeats/controls/dimension and at least 20 diagnostic bootstrap draws")
+    require(0 < args.alpha < 1, "alpha must lie in (0,1)")
+    require(len(set(args.modes)) == len(args.modes) and len(set(args.learners)) == len(args.learners),
+            "Do not repeat a mode or learner")
+    require(math.ceil((args.calibration_units + 1) * (1 - args.alpha)) <= args.calibration_units,
+            "Too few calibration units for a finite split-conformal threshold at this alpha")
+    protect_source(args.output, Path("outputs/esa_real_event_readiness"))
+    protect_source(args.figures, Path("outputs/esa_real_event_readiness"))
+    # Validate ALL planned splits before fitting anything or creating outputs.
+    jobs = []
+    for repeat in range(args.repeats):
+        for mode in args.modes:
+            for held, fold, split in build_splits(frame, args.folds, args.calibration_units,
+                                                 args.seed + repeat, mode):
+                split = limit_training_events(frame, split, args.train_events_per_family,
+                                              stable_seed(args.seed, repeat, mode, held, fold))
+                jobs.append((repeat, mode, held, fold, split))
+    output = new_output(args.output)
+    require(not args.figures.exists() or not any(args.figures.iterdir()),
+            "Figure directory exists and is not empty; choose a versioned figures directory")
+    frozen = {
+        "status": "exploratory_design_data_cross_validation",
+        "feature_sha256": digest(args.features), "script_sha256": digest(__file__),
+        "alpha": args.alpha, "folds": args.folds, "repeats": args.repeats,
+        "calibration_units": args.calibration_units, "probe_block_dimension": args.probe_dim,
+        "training_events_per_family": args.train_events_per_family,
+        "controls": args.controls, "seed": args.seed, "modes": args.modes,
+        "feature_sets": list(BASE_SETS), "horizon_hours": manifest["horizon_hours"],
+        "diagnostic_bootstrap_draws": args.bootstrap,
+        "learners": args.learners, "hyperparameter_search": False,
+        "class_weights": "half nominal, half anomalies; anomaly families equally weighted",
+        "bootstrap": "paired group-resampling of fixed OOF predictions; not a refit confidence interval",
+        "final_ESA_evaluation_units_loaded": False,
+        "environment": {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__},
+    }
+    json_write(output / "protocol.json", frozen)
+    predictions, splits_written, redundancy_rows, dimension_rows = [], [], [], []
+    print("=== MATCHED DEVELOPMENT ABLATIONS ===", flush=True)
+    print("Independent development units:", len(frame), "paired groups:", frame.group_id.nunique())
+    print(f"No hyperparameter search. All {len(BASE_SETS)} feature sets and ALL shuffle controls are reported.")
+    print("Interpretation: exploratory; neither these folds nor their bootstrap create new incidents.")
+    for number, (repeat, mode, held, fold, split) in enumerate(jobs, 1):
+        train, cal, test = [frame.iloc[split[s]].copy() for s in ("train", "calibration", "heldout")]
+        context = {"repeat": repeat, "mode": mode, "held_family": held, "fold": fold}
+        for role, indices in split.items():
+            for r in frame.iloc[indices].itertuples():
+                splits_written.append(context | {"role": role, "unit_id": r.unit_id, "group_id": r.group_id})
+        blocks, dimensions = transform_blocks(train, [cal, test], args.probe_dim)
+        for block, d in dimensions.items():
+            dimension_rows.append(context | {"block": block} | d)
+        # Can ordinary scores/quality linearly reconstruct the directional responses?
+        from sklearn.linear_model import Ridge
+        predictor = Ridge(alpha=10).fit(np.column_stack([blocks["S"][0], blocks["C"][0]]), blocks["D"][0])
+        reconstructed = predictor.predict(np.column_stack([blocks["S"][2], blocks["C"][2]]))
+        sse = float(np.square(reconstructed - blocks["D"][2]).sum())
+        reference_sse = float(np.square(blocks["D"][2] - blocks["D"][0].mean(axis=0)).sum())
+        redundancy_rows.append(context | {"sse": sse, "reference_sse": reference_sse,
+                                          "heldout_units": len(test)})
+
+        def record_scores(learner, feature_set, control_rep, cal_scores, test_scores):
+            threshold = conformal_threshold(cal_scores, args.alpha)
+            for r, score in zip(test.itertuples(), test_scores):
+                predictions.append(context | {"learner": learner, "feature_set": feature_set,
+                    "control_rep": control_rep, "unit_id": r.unit_id, "group_id": r.group_id,
+                    "label": int(r.label), "family": r.family, "score": float(score),
+                    "threshold": threshold, "rejected": int(score > threshold)})
+
+        for model in MODELS:
+            col = f"S__{model}__top_max"
+            record_scores("fixed", model, -1, cal[col].to_numpy(), test[col].to_numpy())
+        cols = [f"S__{m}__top_max" for m in MODELS]
+        record_scores("fixed", "view_max", -1, cal[cols].max(axis=1), test[cols].max(axis=1))
+        for learner in args.learners:
+            for feature_set in BASE_SETS:
+                arrays = [np.column_stack([blocks[b][j] for b in feature_set]) for j in range(3)]
+                model = learner_fit(learner, arrays[0], train, stable_seed(args.seed, repeat, mode, held, fold))
+                record_scores(learner, feature_set, -1, predict_score(model, arrays[1]), predict_score(model, arrays[2]))
+            for control in range(args.controls):
+                # Shuffle only TRAINING unit-to-response associations. The fitted
+                # test-time map and final calibration scores use intact features.
+                order = np.random.default_rng(stable_seed(args.seed, repeat, mode, held, fold, control)).permutation(len(train))
+                arrays = [np.column_stack([blocks["S"][j], blocks["C"][j], blocks["D"][j]]) for j in range(3)]
+                arrays[0] = np.column_stack([blocks["S"][0], blocks["C"][0], blocks["D"][0][order]])
+                model = learner_fit(learner, arrays[0], train, stable_seed(args.seed, repeat, mode, held, fold))
+                record_scores(learner, "SCD_shuffled", control,
+                              predict_score(model, arrays[1]), predict_score(model, arrays[2]))
+            print(f"[{number}/{len(jobs)}] {mode}, withheld={held}, {learner}: "
+                  f"{len(BASE_SETS)} ablations and {args.controls} controls complete", flush=True)
+        print(f"[{number}/{len(jobs)}] {mode}, withheld={held}, repeat={repeat}, fold={fold}: "
+              f"train={len(train)}, cal={len(cal)}, heldout={len(test)}", flush=True)
+    predictions = pd.DataFrame(predictions)
+    prediction_key = ["repeat", "mode", "held_family", "learner", "feature_set", "control_rep", "unit_id"]
+    require(not predictions.duplicated(prediction_key).any(), "An OOF unit was evaluated more than once")
+    predictions.to_csv(output / "oof_predictions.csv", index=False)
+    pd.DataFrame(splits_written).to_csv(output / "split_assignments.csv", index=False)
+    pd.DataFrame(dimension_rows).to_csv(output / "feature_dimensions.csv", index=False)
+    red = pd.DataFrame(redundancy_rows)
+    red.to_csv(output / "probe_reconstruction_by_fold.csv", index=False)
+    metrics = bootstrap_ranges(predictions, args.bootstrap, args.seed)
+    differences = paired_differences(predictions, args.bootstrap, args.seed)
+    metrics.to_csv(output / "metrics.csv", index=False)
+    differences.to_csv(output / "paired_differences.csv", index=False)
+    # Between-split spread is reported separately; repeats are not independent datasets.
+    repeat_metrics = predictions.groupby(["repeat", "mode", "held_family", "learner",
+        "feature_set", "control_rep", "family"], as_index=False).rejected.mean()
+    repeat_metrics.to_csv(output / "split_stability.csv", index=False)
+    make_figures(metrics, differences, args.figures, args.alpha)
+    print("\n=== POWER AND FPR (ALL FIXED ABLATIONS) ===")
+    print(metrics[metrics.control_rep == -1].to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    print("\n=== PAIRED INCREMENTAL VALUE ===")
+    print(differences.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    print("\n=== SHUFFLED-CONTROL DISTRIBUTION (NO BEST-SEED SELECTION) ===")
+    print(metrics[metrics.feature_set == "SCD_shuffled"].groupby(
+        ["mode", "held_family", "learner", "metric", "family"]).estimate.agg(["mean", "min", "max"]).to_string())
+    print("\n=== LINEAR PROBE RECONSTRUCTION FROM SCORES + QUALITY ===")
+    for keys, g in red.groupby(["mode", "held_family"]):
+        denom = g.reference_sse.sum()
+        value = 1 - g.sse.sum() / denom if denom > 1e-12 else np.nan
+        print(keys, "out-of-fold R2 relative to training-mean predictor:", value)
+    print("\nConditional percentile ranges resample independent groups in FIXED OOF predictions.")
+    print("They omit fitting/calibration variability and CV-training dependence: NOT publication confidence intervals.")
+    print("Repeated splits show sensitivity, not additional sample size. No automatic efficacy/novelty PASS.")
+    print("\n=== FILES ===")
+    for p in sorted(output.iterdir()):
+        print(p, f"({p.stat().st_size:,} bytes)")
+    print("Figures:", args.figures)
+    print("PILOT COMPLETE. Retain the original ESA test set for its sealed protocol.", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("extract", help="Extract scores, quality and probe responses from development rows")
+    p.add_argument("--root", type=Path, default=Path("outputs/esa_real_event_readiness"))
+    p.add_argument("--output", type=Path, default=Path("outputs/esa_probe_features_v1"))
+    p.add_argument("--horizon-hours", type=float, default=1.0)
+    p.add_argument("--epsilons", nargs="+", type=float, default=[.05, .20])
+    p.set_defaults(function=extract)
+    p = sub.add_parser("run", help="Run matched within-family and leave-family-out development ablations")
+    p.add_argument("--features", type=Path, default=Path("outputs/esa_probe_features_v1/development_probe_features.csv"))
+    p.add_argument("--output", type=Path, default=Path("outputs/esa_probe_pilot_v1"))
+    p.add_argument("--figures", type=Path, default=Path("figures/esa_probe_pilot_v1"))
+    p.add_argument("--modes", nargs="+", choices=["within", "leave_family_out"], default=["within", "leave_family_out"])
+    p.add_argument("--learners", nargs="+", choices=["logistic", "trees"], default=["logistic", "trees"])
+    p.add_argument("--alpha", type=float, default=.05)
+    p.add_argument("--folds", type=int, default=4)
+    p.add_argument("--calibration-units", type=int, default=30)
+    p.add_argument("--probe-dim", type=int, default=8)
+    p.add_argument("--train-events-per-family", type=int, default=0,
+                   help="Fixed training label budget per family; 0 uses all eligible events")
+    p.add_argument("--controls", type=int, default=10)
+    p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--bootstrap", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=20260916)
+    p.set_defaults(function=run)
+    args = parser.parse_args()
+    args.function(args)
+
+
+if __name__ == "__main__":
+    main()
