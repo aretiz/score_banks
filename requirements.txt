@@ -1,0 +1,11 @@
+# Runtime dependencies for the paper experiments and analysis scripts.
+# Tested with Python 3.14. For a CUDA-specific PyTorch build, follow the
+# platform selector at https://pytorch.org/get-started/locally/.
+
+numpy>=2.4,<3
+pandas>=2.3,<4
+scipy>=1.17,<2
+scikit-learn>=1.8,<2
+matplotlib>=3.10,<4
+requests>=2.32,<3
+torch>=2.13,<2.15
