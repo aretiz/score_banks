@@ -18,18 +18,6 @@ stress test, compact result tables, and a static GitHub Pages website.
 │   ├── run_care_earthnet.py
 │   ├── run_care_frozen_fusion_benchmark.py
 │   └── run_esa_power_decomposition.py
-├── docs
-│   ├── assets
-│   ├── downloads
-│   └── index.html
-├── paper
-│   ├── figures
-│   ├── reo2_manuscript.tex
-│   ├── reo2_manuscript.pdf
-│   ├── reo2_review_corrections_red.tex
-│   └── reo2_review_corrections_red.pdf
-├── results
-├── BEFORE_UPLOAD.md
 ├── REPRODUCIBILITY.md
 └── prepare_complete_repo.sh
 ```
