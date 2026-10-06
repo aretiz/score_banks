@@ -1,0 +1,12 @@
+{
+  "paper_main_pages": 4,
+  "reference_pages": 1,
+  "appendix_pages": 4,
+  "abstract_has_numerical_results": false,
+  "website_link_check": "passed",
+  "github_publication": "not performed; repository access not connected",
+  "website_browser_check": "not run",
+  "repository_preparation_shell_syntax": "passed",
+  "python_syntax_checks": "passed for 26 files",
+  "local_resource_and_anchor_checks": "passed: 24 references and 6 anchors"
+}
