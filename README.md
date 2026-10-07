@@ -1,36 +1,44 @@
-## Calibrating Score Banks for Earth-Observation Anomaly Detection: Multiplicity, Tail Shape, and Power
+# Calibrating Score Banks for Earth Observation Anomaly Detection
 
-This repository is the research companion for the REO2 2026 paper "Calibrating Score Banks for Earth Observation Anomaly Detection. Multiplicity, Tail Shape, and Power."
+Research code for the REO2 2026 paper **“Calibrating Score Banks for Earth Observation Anomaly Detection: Multiplicity, Tail Shape, and Power.”**
 
-## Scope
+The repository contains the EarthNet2021 score bank analysis, calibrated aggregation baselines, and a site-disjoint evaluation on real DynamicEarthNet land-cover changes.
 
-The repository separates the EarthNet score bank study from the ESA real event
-stress test. Data, caches, and checkpoints are not redistributed.
-
-## Environment
-
-The experiments were run from the project virtual environment at `.venv`.
-After the full project files are copied into this repository, activate an
-equivalent environment and install the project dependencies.
+## Setup
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install -e .
 ```
 
-## EarthNet analysis
+The original EarthNet analysis also requires the forecast caches produced by the associated forecasting project. Raw datasets, model checkpoints, and generated caches are not included in this repository.
 
-The main driver is `scripts/run_care_earthnet.py`. It expects the frozen
-EarthNet forecast caches produced by the two exporters.
+## Data
+
+Download the datasets from their official sources.
+
+- [EarthNet2021](https://www.earthnet.tech/)
+- [DynamicEarthNet](https://mediatum.ub.tum.de/1650201)
+
+For the DynamicEarthNet evaluation, extract the Sentinel-2 images and labels under:
+
+```text
+data/dynamic_earthnet/extracted/
+├── sentinel2/
+└── labels/
+```
+
+## Experiments
+
+### EarthNet2021 analysis
 
 ```bash
-python scripts/export_caps_earthnet_cache.py --help
-python scripts/export_caps_earthnet_image_only_cache.py --help
 python scripts/run_care_earthnet.py --help
 ```
 
-The reviewer requested fusion comparison is implemented in
-`scripts/run_care_frozen_fusion_benchmark.py`.
+The calibrated fusion comparison is run with:
 
 ```bash
 python scripts/run_care_frozen_fusion_benchmark.py \
@@ -38,21 +46,23 @@ python scripts/run_care_frozen_fusion_benchmark.py \
   --out outputs/reo2_fusion_benchmark
 ```
 
-Every frozen scalar statistic receives its own split conformal calibration on
-the same 466 nominal cubes. Matched power at the bank's realized FPR is a
-descriptive operating point comparison.
-
-## ESA real event stress test
-
-The ESA analysis requires the official ESA ADB Mission 1 data and the frozen
-protocol artifacts. The main evaluation drivers are shown below.
+### DynamicEarthNet real-change evaluation
 
 ```bash
-python scripts/run_esa_power_decomposition.py --help
-python scripts/run_esa_quality_sealed_evaluation.py --help
+python scripts/run_dynamic_earthnet_score_bank.py \
+  --data data/dynamic_earthnet/extracted \
+  --out outputs/dynamic_earthnet_score_bank
 ```
 
-The forecast score bank and quality feature detectors use different inputs and
-operating points. Their comparison is diagnostic evidence about representation
-alignment. It is not a controlled comparison of aggregation rules.
+The DynamicEarthNet experiment uses disjoint areas for fitting, design, calibration, and testing. Labels define unchanged and changed evaluation patches. They are not used to construct the persistence forecast or residual scores.
 
+## Main files
+
+- `scripts/run_care_earthnet.py` runs the main EarthNet2021 score bank analysis.
+- `scripts/run_care_frozen_fusion_benchmark.py` compares calibrated aggregation rules.
+- `scripts/run_dynamic_earthnet_score_bank.py` runs the real EO change evaluation.
+- `requirements.txt` lists the Python dependencies.
+
+## License
+
+This repository is released under the [MIT License](LICENSE).
